@@ -82,6 +82,7 @@ Allowed intents:
 - rider_info
 - order_location
 - delivery_delay
+- full_order_details
 
 Examples:
 User: my order is late
@@ -90,12 +91,11 @@ Output: {{"intents": ["delivery_delay"]}}
 User: what is the timeslot and status
 Output: {{"intents": ["delivery_timeslot", "order_status"]}}
 
-User: who is the rider
-Output: {{"intents": ["rider_info"]}}
+User: tell me everything about my order
+Output: {{"intents": ["full_order_details"]}}
 
 Rules:
 - Return multiple intents if needed
-- Do NOT return empty unless absolutely unclear
 - Do NOT explain anything
 
 User Query:
@@ -108,27 +108,30 @@ User Query:
             contents=prompt
         )
 
-        text = res.text.strip()
-        text = text.replace("```json", "").replace("```", "")
-
+        text = res.text.strip().replace("```json", "").replace("```", "")
         parsed = json.loads(text)
         return parsed.get("intents", [])
 
-    except Exception as e:
-        print("Intent Error:", e)
+    except:
         return []
 
 # ----------------------------
-# CONTEXT-AWARE INTENTS 🔥
+# CONTEXT INTENTS
 # ----------------------------
 def get_context_intents(user_input, memory):
+
+    text = user_input.lower()
+
+    # 🔥 HARD OVERRIDE (MOST IMPORTANT)
+    if any(word in text for word in ["everything", "all details", "full details", "complete"]):
+        return ["full_order_details"]
 
     current = get_intents(user_input)
 
     if current:
         return current
 
-    # fallback to last meaningful intent
+    # fallback
     for chat in reversed(memory["history"]):
         if chat["intents"]:
             return chat["intents"]
@@ -136,14 +139,11 @@ def get_context_intents(user_input, memory):
     return []
 
 # ----------------------------
-# FORMAT HISTORY FOR LLM 🔥
+# FORMAT HISTORY
 # ----------------------------
 def format_history(memory):
     history = memory["history"][-3:]
-    text = ""
-    for chat in history:
-        text += f"User: {chat['user']}\nBot: {chat['bot']}\n"
-    return text
+    return "\n".join([f"User: {c['user']}\nBot: {c['bot']}" for c in history])
 
 # ----------------------------
 # DATA EXTRACTION
@@ -174,34 +174,39 @@ def extract_data(intent, order):
             return f"Order ID {oid} has no delay information available"
         return f"Order ID {oid} is delayed by {delay} minutes"
 
+    elif intent == "full_order_details":
+
+        delay = order['delivery_delay']
+        delay_text = f"{delay} minutes" if pd.notna(delay) else "Not available"
+
+        return (
+            f"Order ID {oid} details:\n"
+            f"- Status: {order['delivery_status']}\n"
+            f"- Delivery Date: {order['delivery_date']}\n"
+            f"- Timeslot: {order['delivery_timeslot']}\n"
+            f"- ETA: {order['eta']} minutes\n"
+            f"- Rider: {rider}\n"
+            f"- Warehouse: {order['depo_name']}\n"
+            f"- Delay: {delay_text}"
+        )
+
     return None
 
 # ----------------------------
-# RESPONSE GENERATOR (WITH CONTEXT)
+# RESPONSE GENERATOR
 # ----------------------------
 def summarize_response(user_input, data, memory):
 
-    history_text = format_history(memory)
-
     prompt = f"""
-You are a professional customer care assistant.
+Conversation:
+{format_history(memory)}
 
-Conversation History:
-{history_text}
-
-User Query:
-{user_input}
+User: {user_input}
 
 Data:
 {data}
 
-Rules:
-- Use context if needed
-- 1–2 sentences
-- Friendly tone
-- No extra info
-
-Response:
+Make a short polite response.
 """
 
     try:
@@ -214,38 +219,25 @@ Response:
         return data
 
 # ----------------------------
-# COMPLEX QUERY (WITH CONTEXT)
+# COMPLEX QUERY
 # ----------------------------
 def handle_complex_query(user_input, order, memory):
 
-    history_text = format_history(memory)
-
     oid = order['order_id']
 
-    full_data = f"""
-Order ID: {oid}
-Status: {order['delivery_status']}
-Delivery Date: {order['delivery_date']}
-ETA: {order['eta']}
-Rider: {order['rider']}
-"""
-
     prompt = f"""
-Conversation History:
-{history_text}
+Conversation:
+{format_history(memory)}
 
-User Query:
-{user_input}
+User: {user_input}
 
-Order Data:
-{full_data}
+Order:
+ID: {oid}
+Status: {order['delivery_status']}
+Date: {order['delivery_date']}
+ETA: {order['eta']}
 
-Rules:
-- Use context
-- Be short
-- No guessing
-
-Response:
+Answer clearly.
 """
 
     try:
@@ -302,7 +294,7 @@ def main():
                     print("Bot: No order selected yet.")
                 continue
 
-            # ORDER SWITCH
+            # SWITCH ORDER
             detected = detect_order_selection(user_input, orders_df)
 
             if detected is not None:
@@ -318,7 +310,6 @@ def main():
 
                 else:
                     print("\nBot: Select an order:")
-
                     for i, row in orders_df.iterrows():
                         print(f"{i+1}. Order {row['order_id']} | {row['order_date']}")
 
@@ -332,28 +323,35 @@ def main():
 
             order = memory["selected_order"]
 
-            # 🔥 CONTEXT INTENTS
+            # 🔥 INTENTS
             intents = get_context_intents(user_input, memory)
             print("🧠 Intents:", intents)
 
-            responses = []
-
-            for intent in intents:
-                r = extract_data(intent, order)
-                if r:
-                    responses.append(r)
-
-            if len(responses) == 1:
-                final_response = responses[0]
-
-            elif len(responses) > 1:
-                final_response = summarize_response(user_input, " | ".join(responses), memory)
+            # 🔥 PRIORITY: FULL DETAILS
+            if "full_order_details" in intents:
+                final_response = extract_data("full_order_details", order)
+                print("\n🤖 Bot:", final_response)
 
             else:
-                final_response = handle_complex_query(user_input, order, memory)
+                responses = []
 
-            print("\n🤖 Bot:", final_response)
+                for intent in intents:
+                    r = extract_data(intent, order)
+                    if r:
+                        responses.append(r)
 
+                if len(responses) == 1:
+                    final_response = responses[0]
+
+                elif len(responses) > 1:
+                    final_response = summarize_response(user_input, " | ".join(responses), memory)
+
+                else:
+                    final_response = handle_complex_query(user_input, order, memory)
+
+                print("\n🤖 Bot:", final_response)
+
+            # SAVE MEMORY
             memory["history"].append({
                 "user": user_input,
                 "bot": final_response,
